@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default=None, help="Optional override for the base_url in LLM_SETTINGS")
     parser.add_argument("--api-key", default=None, help="Optional override for the api_key in LLM_SETTINGS")
     parser.add_argument("--temperature", type=float, default=None, help="Optional override for the temperature in LLM_SETTINGS")
+    parser.add_argument("--resume", action="store_true", help="Resume from existing output CSV if present")
     return parser.parse_args()
 
 
@@ -210,6 +211,14 @@ def generate_signals(args: argparse.Namespace) -> list[dict]:
         "last_target_position": 0.0,
     }
     pending_target_position: float | None = None
+    existing_by_signal_date: dict[str, dict] = {}
+
+    if args.resume:
+        output_path = Path(args.output)
+        if output_path.exists():
+            with output_path.open("r", encoding="utf-8-sig", newline="") as f:
+                existing_rows = list(csv.DictReader(f))
+            existing_by_signal_date = {str(row["signal_date"]): row for row in existing_rows}
 
     for index in range(args.window - 1, len(bars) - 1):
         visible_bars = bars[index - args.window + 1:index + 1]
@@ -221,6 +230,16 @@ def generate_signals(args: argparse.Namespace) -> list[dict]:
             apply_target_on_open(state, pending_target_position, today_bar["open"], args.lot_size)
 
         position_state = build_position_state(state, today_bar["close"])
+
+        existing_row = existing_by_signal_date.get(signal_date)
+        if existing_row:
+            target_position = float(existing_row["target_position"])
+            signal = str(existing_row["signal"])
+            rows.append(existing_row)
+            pending_target_position = target_position
+            state["last_signal"] = signal
+            state["last_target_position"] = target_position
+            continue
 
         payload = {
             "vt_symbol": args.vt_symbol,
@@ -236,17 +255,19 @@ def generate_signals(args: argparse.Namespace) -> list[dict]:
         current_position = float(position_state["current_position"])
         decision.signal = infer_signal(decision.target_position, current_position)
 
-        rows.append(
-            {
-                "signal_date": signal_date,
-                "trade_date": trade_date,
-                "vt_symbol": args.vt_symbol,
-                "signal": decision.signal,
-                "target_position": f"{decision.target_position:.4f}",
-                "confidence": f"{decision.confidence:.4f}",
-                "reason": decision.reason,
-            }
-        )
+        row = {
+            "signal_date": signal_date,
+            "trade_date": trade_date,
+            "vt_symbol": args.vt_symbol,
+            "signal": decision.signal,
+            "target_position": f"{decision.target_position:.4f}",
+            "confidence": f"{decision.confidence:.4f}",
+            "reason": decision.reason,
+        }
+        rows.append(row)
+        if args.resume:
+            append_row(row, args.output)
+        print(f"[{len(rows)}] {signal_date} -> {trade_date} {row['signal']} {row['target_position']}")
 
         pending_target_position = decision.target_position
         state["last_signal"] = decision.signal
@@ -275,10 +296,31 @@ def save_rows(rows: list[dict], output_path: str) -> None:
         writer.writerows(rows)
 
 
+def append_row(row: dict[str, str], output_path: str) -> None:
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = path.exists()
+    fieldnames = [
+        "signal_date",
+        "trade_date",
+        "vt_symbol",
+        "signal",
+        "target_position",
+        "confidence",
+        "reason",
+    ]
+    with path.open("a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def main() -> None:
     args = parse_args()
     rows = generate_signals(args)
-    save_rows(rows, args.output)
+    if not args.resume:
+        save_rows(rows, args.output)
     print(f"Generated {len(rows)} rows -> {args.output}")
 
 

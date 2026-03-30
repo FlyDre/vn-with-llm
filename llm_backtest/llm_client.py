@@ -4,6 +4,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,13 +25,15 @@ class OpenAICompatibleClient:
         api_key: str | None = None,
         model: str | None = None,
         base_url: str | None = None,
-        timeout: int = 60,
+        timeout: int = 120,
+        max_retries: int = 4,
         temperature: float = 0.0,
     ) -> None:
         self.api_key: str = api_key or os.getenv("LLM_API_KEY", "")
         self.model: str = model or os.getenv("LLM_MODEL", "")
         self.base_url: str = (base_url or os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
         self.timeout: int = timeout
+        self.max_retries: int = max_retries
         self.temperature: float = temperature
 
         if not self.api_key:
@@ -81,32 +84,51 @@ class OpenAICompatibleClient:
             "$resp.Content"
         )
 
-        result = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                command,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=self.timeout,
-            encoding="utf-8",
-            errors="replace",
-        )
+        last_error: str = ""
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                result = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        command,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            except subprocess.TimeoutExpired as exc:
+                last_error = f"request timed out after {self.timeout} seconds"
+                if attempt == self.max_retries:
+                    raise RuntimeError(last_error) from exc
+                time.sleep(min(2 ** attempt, 15))
+                continue
 
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            stdout = result.stdout.strip()
-            detail = stderr or stdout or "unknown error"
-            raise RuntimeError(f"LLM request failed via PowerShell: {detail}")
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                stdout = result.stdout.strip()
+                last_error = stderr or stdout or "unknown error"
+                if ("502" in last_error or "504" in last_error or "timeout" in last_error.lower()) and attempt < self.max_retries:
+                    time.sleep(min(2 ** attempt, 15))
+                    continue
+                raise RuntimeError(f"LLM request failed via PowerShell: {last_error}")
 
-        content: str = result.stdout.strip()
-        if not content:
-            detail = result.stderr.strip() or "stdout and stderr are both empty"
-            raise RuntimeError(f"LLM request returned empty response: {detail}")
+            content = result.stdout.strip()
+            if not content:
+                last_error = result.stderr.strip() or "stdout and stderr are both empty"
+                if ("502" in last_error or "504" in last_error or "timeout" in last_error.lower()) and attempt < self.max_retries:
+                    time.sleep(min(2 ** attempt, 15))
+                    continue
+                raise RuntimeError(f"LLM request returned empty response: {last_error}")
+
+            break
+        else:
+            raise RuntimeError(last_error or "LLM request failed after retries")
 
         data: dict[str, Any] = json.loads(content)
         message: str = self._extract_message_text(data)
