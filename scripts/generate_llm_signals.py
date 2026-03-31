@@ -20,9 +20,9 @@ from llm_backtest.prompt import ALLOWED_POSITIONS, build_daily_bar_prompt
 # Fill these values once, then you can run the script directly without
 # re-entering them in PowerShell every time.
 LLM_SETTINGS: dict[str, object] = {
-    "api_key": "sk-ZGQvW4wh6dkj5L3NOKhbfotgitUqu5Hftp1qtNR8LjH4DnEj",
+    "api_key": "sk-LytQhG0k9Mp4ZDLD8NpG42pcrv4uEWhVmPmpr0NKZCWtza1m",
     "model": "gpt-5.3-codex",
-    "base_url": "https://api.squarefaceicon.org/v1",
+    "base_url": "https://apixg.squarefaceicon.org/v1",
     "temperature": 0.0,
 }
 
@@ -40,7 +40,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default=None, help="Optional override for the base_url in LLM_SETTINGS")
     parser.add_argument("--api-key", default=None, help="Optional override for the api_key in LLM_SETTINGS")
     parser.add_argument("--temperature", type=float, default=None, help="Optional override for the temperature in LLM_SETTINGS")
+    parser.add_argument("--llm-timeout", type=int, default=30, help="Per-request timeout seconds for each LLM HTTP call")
+    parser.add_argument("--llm-retries", type=int, default=2, help="Retry count per signal date across all endpoint variants")
     parser.add_argument("--resume", action="store_true", help="Resume from existing output CSV if present")
+    parser.add_argument(
+        "--strict-llm",
+        action="store_true",
+        help="Fail fast on any LLM request error. Default behavior is fallback-to-hold and continue.",
+    )
     return parser.parse_args()
 
 
@@ -198,6 +205,8 @@ def generate_signals(args: argparse.Namespace) -> list[dict]:
         model=model,
         base_url=base_url,
         temperature=temperature,
+        timeout=args.llm_timeout,
+        max_retries=args.llm_retries,
     )
 
     rows: list[dict] = []
@@ -212,13 +221,19 @@ def generate_signals(args: argparse.Namespace) -> list[dict]:
     }
     pending_target_position: float | None = None
     existing_by_signal_date: dict[str, dict] = {}
+    output_path = Path(args.output)
+    auto_resume = args.resume or output_path.exists()
 
-    if args.resume:
-        output_path = Path(args.output)
-        if output_path.exists():
-            with output_path.open("r", encoding="utf-8-sig", newline="") as f:
-                existing_rows = list(csv.DictReader(f))
-            existing_by_signal_date = {str(row["signal_date"]): row for row in existing_rows}
+    if auto_resume and output_path.exists():
+        with output_path.open("r", encoding="utf-8-sig", newline="") as f:
+            existing_rows = list(csv.DictReader(f))
+        existing_by_signal_date = {str(row["signal_date"]): row for row in existing_rows}
+        if existing_rows and not args.resume:
+            print(
+                f"[INFO] Auto-resume enabled: found existing output with {len(existing_rows)} rows -> {args.output}"
+            )
+    else:
+        init_output_file(args.output)
 
     for index in range(args.window - 1, len(bars) - 1):
         visible_bars = bars[index - args.window + 1:index + 1]
@@ -250,10 +265,25 @@ def generate_signals(args: argparse.Namespace) -> list[dict]:
         }
 
         system_prompt, user_prompt = build_daily_bar_prompt(payload)
-        decision: LlmDecision = client.complete(system_prompt, user_prompt)
-        decision.target_position = snap_position(decision.target_position)
         current_position = float(position_state["current_position"])
-        decision.signal = infer_signal(decision.target_position, current_position)
+        try:
+            decision: LlmDecision = client.complete(system_prompt, user_prompt)
+            decision.target_position = snap_position(decision.target_position)
+            decision.signal = infer_signal(decision.target_position, current_position)
+        except Exception as exc:
+            if args.strict_llm:
+                raise
+            fallback_position = snap_position(current_position)
+            short_error = str(exc).replace("\n", " ").strip()
+            if len(short_error) > 180:
+                short_error = short_error[:177] + "..."
+            decision = LlmDecision(
+                signal="hold",
+                target_position=fallback_position,
+                confidence=0.0,
+                reason=f"llm_error_fallback: {short_error}",
+            )
+            print(f"[WARN] {signal_date} LLM failed, fallback to hold: {short_error}")
 
         row = {
             "signal_date": signal_date,
@@ -265,8 +295,7 @@ def generate_signals(args: argparse.Namespace) -> list[dict]:
             "reason": decision.reason,
         }
         rows.append(row)
-        if args.resume:
-            append_row(row, args.output)
+        append_row(row, args.output)
         print(f"[{len(rows)}] {signal_date} -> {trade_date} {row['signal']} {row['target_position']}")
 
         pending_target_position = decision.target_position
@@ -316,12 +345,27 @@ def append_row(row: dict[str, str], output_path: str) -> None:
         writer.writerow(row)
 
 
+def init_output_file(output_path: str) -> None:
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "signal_date",
+        "trade_date",
+        "vt_symbol",
+        "signal",
+        "target_position",
+        "confidence",
+        "reason",
+    ]
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+
 def main() -> None:
     args = parse_args()
     rows = generate_signals(args)
-    if not args.resume:
-        save_rows(rows, args.output)
-    print(f"Generated {len(rows)} rows -> {args.output}")
+    print(f"Generated/loaded {len(rows)} rows -> {args.output}")
 
 
 if __name__ == "__main__":
