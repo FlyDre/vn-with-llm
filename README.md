@@ -1,3 +1,7 @@
+# 中转站：
+https://api.squarefaceicon.org/
+-------------------------------------------
+
 # create .venv folder
 
 py -3.13 -m venv .venv
