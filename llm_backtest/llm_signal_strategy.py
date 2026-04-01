@@ -150,8 +150,8 @@ class LlmSignalStrategy(CtaTemplate):
                 if row.get("vt_symbol") != self.vt_symbol:
                     continue
 
-                trade_date: date = date.fromisoformat(str(row["trade_date"]))
-                signal_map[trade_date] = row
+                signal_date: date = date.fromisoformat(str(row["signal_date"]))
+                signal_map[signal_date] = row
 
         self.write_log(f"Loaded {len(signal_map)} signals from {path}")
         return signal_map
